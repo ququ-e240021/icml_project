@@ -1,0 +1,3 @@
+[submodule "external/condensed-sparsity"]
+	path = external/condensed-sparsity
+	url = https://github.com/calgaryml/condensed-sparsity.git
