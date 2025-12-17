@@ -1,3 +1,6 @@
 [submodule "external/condensed-sparsity"]
 	path = external/condensed-sparsity
 	url = https://github.com/calgaryml/condensed-sparsity.git
+[submodule "external/rigl-torch"]
+	path = external/rigl-torch
+	url = https://github.com/verbiiyo/rigl-torch.git
