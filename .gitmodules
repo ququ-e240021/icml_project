@@ -4,3 +4,6 @@
 [submodule "external/rigl-torch"]
 	path = external/rigl-torch
 	url = https://github.com/verbiiyo/rigl-torch.git
+[submodule "classification/pytorch-image-models"]
+	path = classification/pytorch-image-models
+	url = https://github.com/huggingface/pytorch-image-models.git
