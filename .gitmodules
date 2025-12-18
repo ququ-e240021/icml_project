@@ -7,3 +7,6 @@
 [submodule "classification/pytorch-image-models"]
 	path = classification/pytorch-image-models
 	url = https://github.com/huggingface/pytorch-image-models.git
+[submodule "ssl/lightly"]
+	path = ssl/lightly
+	url = https://github.com/lightly-ai/lightly.git
