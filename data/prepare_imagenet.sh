@@ -1,104 +1,149 @@
 #!/bin/bash
-set -e  # 遇到错误立即停止
+set -e  # 遇到错误立即退出
 
-# =================配置部分=================
+# ================= 配置区域 =================
 # 获取脚本所在目录 (data/)
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-# 项目根目录
+# 获取项目根目录
 PROJECT_ROOT=$(dirname "$SCRIPT_DIR")
-# 数据集存放目标目录
+# 设置数据集目标路径
 TARGET_DIR="$PROJECT_ROOT/datasets/imagenet"
 
-mkdir -p "$TARGET_DIR"
+# 创建标准的 Train 和 Val 目录
+mkdir -p "$TARGET_DIR/train"
+mkdir -p "$TARGET_DIR/val"
 
 echo "========================================"
-echo "ImageNet 数据准备脚本"
+echo "ImageNet 全量下载与整合脚本 (0,1,2,3 + Val)"
 echo "目标目录: $TARGET_DIR"
 echo "========================================"
 
-# ================= 1. 下载部分 =================
-cd "$TARGET_DIR"
+# ================= 1. 获取 Kaggle 凭据 =================
+KAGGLE_JSON="$HOME/.kaggle/kaggle.json"
+KAGGLE_USER=""
+KAGGLE_KEY=""
 
-# 检查是否已有文件，如果没有则尝试下载
-# 注意：你需要安装 kaggle cli: pip install kaggle 并配置好 ~/.kaggle/kaggle.json
-if [ ! -f "ILSVRC2012_img_train.tar" ] && [ ! -f "ILSVRC2012_img_val.tar" ]; then
-    echo "未检测到压缩包，尝试使用 Kaggle API 下载..."
-    echo "请确保你已经安装并配置了 Kaggle CLI (pip install kaggle)"
+# 自动读取凭据
+if [ -f "$KAGGLE_JSON" ]; then
+    echo "读取凭据: $KAGGLE_JSON"
+    KAGGLE_USER=$(grep -oP '(?<="username": ")[^"]*' "$KAGGLE_JSON" || true)
+    KAGGLE_KEY=$(grep -oP '(?<="key": ")[^"]*' "$KAGGLE_JSON" || true)
+fi
+
+# 如果读取失败，手动输入
+if [ -z "$KAGGLE_USER" ] || [ -z "$KAGGLE_KEY" ]; then
+    echo "错误: 无法读取 Kaggle 凭据，请手动输入。"
+    read -p "Username: " KAGGLE_USER
+    read -p "Key: " KAGGLE_KEY
+fi
+
+if [ -z "$KAGGLE_USER" ] || [ -z "$KAGGLE_KEY" ]; then
+    echo "错误: 必须提供凭据才能下载。"
+    exit 1
+fi
+
+# ================= 2. 定义核心处理函数 =================
+# 参数: 1=数据集Slug, 2=保存文件名, 3=最终目标目录(train或val)
+process_dataset() {
+    DATASET_SLUG=$1
+    FILENAME=$2
+    DEST_DIR=$3
     
-    # 尝试下载 (ImageNet Object Localization Challenge 是兼容 ILSVRC2012 的)
-    kaggle competitions download -c imagenet-object-localization-challenge
+    FULL_URL="https://www.kaggle.com/api/v1/datasets/download/$DATASET_SLUG"
     
-    # Kaggle 下载的通常是一个巨大的 zip，需要解压出里面的 tar
-    if [ -f "imagenet-object-localization-challenge.zip" ]; then
-        echo "正在解压 Kaggle 下载的大包..."
-        unzip imagenet-object-localization-challenge.zip
-        # Kaggle 包命名可能不同，这里做一下标准化重命名（视情况而定）
-        # 通常 Kaggle 解压后就是 ILSVRC2012_img_train.tar 等
+    cd "$TARGET_DIR"
+    echo "------------------------------------------------"
+    echo ">>> 正在处理任务: $DATASET_SLUG"
+    
+    # --- 步骤 A: 下载 ---
+    if [ ! -f "$FILENAME" ]; then
+        echo "   [下载] 正在下载 $FILENAME ..."
+        # -C - 支持断点续传
+        curl -L -C - -u "${KAGGLE_USER}:${KAGGLE_KEY}" -o "$FILENAME" "$FULL_URL"
+    else
+        echo "   [下载] 文件 $FILENAME 已存在，跳过下载。"
     fi
-else
-    echo "检测到本地已有 .tar 文件，跳过下载步骤。"
-fi
-
-# ================= 2. 解压训练集 (Train) =================
-# 训练集结构：tar包里包含1000个小的tar包（每个类别一个）
-if [ ! -d "train" ]; then
-    echo "[Train] 开始处理训练集..."
-    mkdir -p train && cd train
     
-    # 解压主包
-    echo "--> 解压 ILSVRC2012_img_train.tar ..."
-    tar -xvf ../ILSVRC2012_img_train.tar > /dev/null
-
-    echo "--> 解压 1000 个类别的子压缩包 (这需要一些时间)..."
-    # 遍历所有 .tar 文件，解压到同名文件夹并删除原 tar
-    find . -name "*.tar" | while read NAME ; do 
-        mkdir -p "${NAME%.tar}"
-        tar -xvf "${NAME}" -C "${NAME%.tar}" > /dev/null
-        rm -f "${NAME}"
-    done
+    # --- 步骤 B: 解压 ---
+    TEMP_DIR="${FILENAME}_extract_temp"
     
-    cd ..
-    echo "[Train] 训练集处理完毕。"
-else
-    echo "[Train] train 文件夹已存在，跳过。"
-fi
-
-# ================= 3. 解压并整理验证集 (Val) =================
-# 验证集痛点：解压出来是乱的，PyTorch ImageFolder 需要它们按类别放在子文件夹里
-if [ ! -d "val" ]; then
-    echo "[Val] 开始处理验证集..."
-    mkdir -p val && cd val
+    # 为了节省时间，如果之前解压中断过，先清理
+    rm -rf "$TEMP_DIR"
+    mkdir -p "$TEMP_DIR"
     
-    echo "--> 解压 ILSVRC2012_img_val.tar ..."
-    tar -xvf ../ILSVRC2012_img_val.tar > /dev/null
+    echo "   [解压] 正在解压到临时目录 (请耐心等待)..."
+    # -q 安静模式, -o 覆盖不提示
+    unzip -q -o "$FILENAME" -d "$TEMP_DIR"
     
-    echo "--> 下载并运行 valprep.sh (整理验证集文件夹结构)..."
-    # 下载大神 Soumith 提供的验证集整理脚本
-    wget -qO- https://raw.githubusercontent.com/soumith/imagenetloader.torch/master/valprep.sh | bash
+    # --- 步骤 C: 合并/移动 ---
+    echo "   [合并] 正在将数据合并入 $DEST_DIR ..."
     
-    cd ..
-    echo "[Val] 验证集整理完毕。"
-else
-    echo "[Val] val 文件夹已存在，跳过。"
-fi
-
-# ================= 4. 解压测试集 (Test) - 可选 =================
-# 注意：Test 集通常没有标签，用于比赛提交，平时训练很少用
-if [ -f "ILSVRC2012_img_test.tar" ]; then
-    if [ ! -d "test" ]; then
-        echo "[Test] 开始处理测试集..."
-        mkdir -p test && cd test
-        tar -xvf ../ILSVRC2012_img_test.tar > /dev/null
-        cd ..
-        echo "[Test] 测试集处理完毕。"
+    # 智能寻找数据根目录 (应对 zip 包内结构不一致的问题)
+    # 优先级: 指定文件夹 -> data文件夹 -> 当前文件夹
+    if [ -d "$TEMP_DIR/valid" ]; then
+        SOURCE="$TEMP_DIR/valid/"
+    elif [ -d "$TEMP_DIR/imagenet1k-0" ]; then
+        SOURCE="$TEMP_DIR/imagenet1k-0/"
+    elif [ -d "$TEMP_DIR/imagenet1k-1" ]; then
+        SOURCE="$TEMP_DIR/imagenet1k-1/"
+    elif [ -d "$TEMP_DIR/imagenet1k-2" ]; then
+        SOURCE="$TEMP_DIR/imagenet1k-2/"
+    elif [ -d "$TEMP_DIR/imagenet1k-3" ]; then
+        SOURCE="$TEMP_DIR/imagenet1k-3/"
+    elif [ -d "$TEMP_DIR/data" ]; then
+        SOURCE="$TEMP_DIR/data/"
+    else
+        SOURCE="$TEMP_DIR/"
     fi
-else
-    echo "[Test] 未找到 ILSVRC2012_img_test.tar，跳过测试集。"
-fi
+    
+    # 使用 cp -rf 强制合并所有内容到目标文件夹
+    # 注意: 结尾的 . 表示复制该目录下所有内容（包括隐藏文件）
+    cp -rf "$SOURCE". "$DEST_DIR/"
+    
+    # --- 步骤 D: 清理 ---
+    echo "   [清理] 删除临时解压目录..."
+    rm -rf "$TEMP_DIR"
+    
+    # 如果您希望下载完且解压成功后立即删除 ZIP 以节省空间，请取消下面这行的注释
+    # rm "$FILENAME"
+    
+    echo ">>> $DATASET_SLUG 处理完成。"
+}
 
+# ================= 3. 执行所有任务 =================
+
+# 1. 验证集 (Valid) -> datasets/imagenet/val
+process_dataset "sautkin/imagenet1kvalid" "valid.zip" "$TARGET_DIR/val"
+
+# 2. 训练集 Part 0 (Classes 0-499) -> datasets/imagenet/train
+process_dataset "sautkin/imagenet1k0" "train_part0.zip" "$TARGET_DIR/train"
+
+# 3. 训练集 Part 1 (Classes 500-999) -> datasets/imagenet/train
+process_dataset "sautkin/imagenet1k1" "train_part1.zip" "$TARGET_DIR/train"
+
+# 4. 训练集 Part 2 (Classes 0-499 Redundant) -> datasets/imagenet/train
+process_dataset "sautkin/imagenet1k2" "train_part2.zip" "$TARGET_DIR/train"
+
+# 5. 训练集 Part 3 (Classes 500-999 Redundant) -> datasets/imagenet/train
+process_dataset "sautkin/imagenet1k3" "train_part3.zip" "$TARGET_DIR/train"
+
+# ================= 4. 最终验证 =================
 echo "========================================"
-echo "所有任务完成！"
-echo "数据位于: $TARGET_DIR"
-echo "结构如下:"
-ls -F "$TARGET_DIR"
+echo "所有任务执行完毕！"
+echo "正在统计文件结构..."
+
+TRAIN_DIRS=$(find "$TARGET_DIR/train" -mindepth 1 -maxdepth 1 -type d | wc -l)
+VAL_DIRS=$(find "$TARGET_DIR/val" -mindepth 1 -maxdepth 1 -type d | wc -l)
+
+echo "----------------------------------------"
+echo "Train 文件夹类别数量: $TRAIN_DIRS (应为 1000)"
+echo "Val   文件夹类别数量: $VAL_DIRS (应为 1000)"
+echo "----------------------------------------"
+
+if [ "$TRAIN_DIRS" -eq 1000 ] && [ "$VAL_DIRS" -eq 1000 ]; then
+    echo "✅ 成功: ImageNet 数据集已完整就绪！"
+else
+    echo "⚠️  警告: 类别数量不匹配，请检查下载日志。"
+fi
+echo "数据位置: $TARGET_DIR"
 echo "========================================"
