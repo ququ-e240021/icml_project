@@ -51,10 +51,9 @@ class GolayConv2d(nn.Module):
     ):
         super().__init__()
         self.in_channels = in_channels
-        self.out_channels = out_channels
         self.use_rms_norm = use_rms_norm
         
-        # --- A. 计算分块逻辑 (Channel Dimension) ---
+        # --- 1. 计算分块逻辑 ---
         best_block_size = 1
         curr = 1
         while curr <= in_channels:
@@ -64,88 +63,73 @@ class GolayConv2d(nn.Module):
         self.block_size = best_block_size
         self.num_blocks = in_channels // best_block_size
         
-        # --- B. 注册 Golay 序列 ---
-        # 形状设为 (1, C, 1, 1) 以便在 (N, C, H, W) 上广播
+        # --- 2. Golay 序列 ---
+        # Shape: (1, C, 1, 1)
         golay = generate_truncated_golay(in_channels)
         self.register_buffer('golay_sequence', golay.view(1, in_channels, 1, 1))
 
-        # --- C. 归一化 ---
+        # --- 3. 归一化 ---
         if use_rms_norm:
-            # RMSNorm 通常作用于最后一维。
-            # 我们将在 (N, H, W, C) 状态下应用它
             self.norm = nn.RMSNorm(in_channels, eps=eps)
         else:
             self.norm = nn.Identity()
 
-        # --- D. 标准卷积层 ---
-        # 这里的卷积层负责空间聚合
+        # --- 4. 标准卷积 ---
         self.conv = nn.Conv2d(
             in_channels, out_channels, kernel_size, 
             stride, padding, dilation, groups, bias
         )
 
-    def _transform_channels(self, x):
+    def _transform_channels(self, x, is_weight=False):
         """
-        对输入张量的 Channel 维度进行 Golay 调制和 FWHT 变换。
-        支持 x 为 (N, C, H, W) 或 权重张量 (Out, C, K1, K2)
+        全流程通道变换：Golay -> Permute -> FWHT -> [RMSNorm] -> Restore
+        Args:
+            x: 输入张量
+            is_weight (bool): 如果是处理权重矩阵，则强制跳过 RMSNorm
         """
-        # 1. Golay Modulation
-        # 确保 golay_sequence 的维度能广播
-        # x: [..., C, H, W], golay: [1, C, 1, 1]
-        # 如果 x 是权重 [Out, C, K, K], golay 需要 reshape 适配
+        # A. Golay Modulation
         if x.dim() == 4 and x.shape[1] == self.in_channels:
+             # Standard forward: (N, C, H, W) -> broadcast (1, C, 1, 1)
+             golay_view = self.golay_sequence
+        elif x.dim() == 4: 
+             # Weight transformation: (Out, In, K, K) -> broadcast (1, In, 1, 1)
              golay_view = self.golay_sequence.view(1, -1, 1, 1)
         else:
-             # Fallback logic for weird shapes if necessary
              golay_view = self.golay_sequence.flatten()
         
         x_mod = x * golay_view
 
-        # 2. 维度置换 (Permute)
-        # FWHT 需要作用在最后一维。
+        # B. Permute to (..., C) for FWHT
         # (N, C, H, W) -> (N, H, W, C)
         n, c, h, w = x_mod.shape
         x_perm = x_mod.permute(0, 2, 3, 1) 
         
-        # 3. Block Splitting & FWHT
-        # View: (N, H, W, num_blocks, block_size)
+        # C. Block FWHT
         x_reshaped = x_perm.reshape(n, h, w, self.num_blocks, self.block_size)
-        
-        # FWHT on last dim
         x_trans = fast_walsh_hadamard_transform(x_reshaped)
         
-        # 4. Restore Shape
-        # Flatten blocks back to C: (N, H, W, C)
+        # Flatten blocks back: (N, H, W, C)
         x_mixed = x_trans.reshape(n, h, w, c)
         
-        # Permute back to (N, C, H, W)
+        # D. RMS Norm (关键修改点：直接在这里做)
+        # 只有在不是处理权重，且开启了 norm 时才执行
+        if self.use_rms_norm and not is_weight:
+            x_mixed = self.norm(x_mixed)
+
+        # E. Permute back to (N, C, H, W)
         x_out = x_mixed.permute(0, 3, 1, 2)
         
-        return x_out, x_mixed # 返回 x_mixed 是为了给 RMSNorm 用 (它喜欢 last dim)
+        return x_out
 
     def forward(self, x):
-        # x: (N, C_in, H, W)
+        # 1. 预处理 (Golay + FWHT + Norm)
+        x_ready = self._transform_channels(x, is_weight=False)
         
-        # 1. 变换通道
-        x_out_nchw, x_out_nhwc = self._transform_channels(x)
-        
-        # 2. 归一化 (如果在 Channel 维做)
-        if self.use_rms_norm:
-            # 在 NHWC 格式下做 Norm 更方便
-            x_norm_nhwc = self.norm(x_out_nhwc)
-            # 转回 NCHW 喂给 Conv2d
-            x_ready = x_norm_nhwc.permute(0, 3, 1, 2)
-        else:
-            x_ready = x_out_nchw
-            
-        # 3. 空间卷积
+        # 2. 空间卷积
         return self.conv(x_ready)
 
     @classmethod
     def from_pretrained(cls, original_conv: nn.Conv2d):
-        """
-        将标准 Conv2d 转换为 GolayConv2d，保持输出一致性。
-        """
         instance = cls(
             original_conv.in_channels,
             original_conv.out_channels,
@@ -155,26 +139,22 @@ class GolayConv2d(nn.Module):
             original_conv.dilation,
             original_conv.groups,
             original_conv.bias is not None,
-            use_rms_norm=False # 必须关闭 Norm 以保证等价
+            use_rms_norm=False # 等价转换必须关闭 Norm
         )
         
         if original_conv.bias is not None:
             instance.conv.bias.data = original_conv.bias.data.clone()
             
         with torch.no_grad():
-            # 原始权重形状: (Out, In, K, K)
             w_original = original_conv.weight.data
-            
-            # 我们需要对 Dimension 1 (In) 做变换。
-            # _transform_channels 期望 (N, C, H, W)。
-            # 我们可以直接把 weights 当作 feature maps 传入：
-            # N=Out, C=In, H=K, W=K
-            w_trans, _ = instance._transform_channels(w_original)
-            
+            # 在这里我们标记 is_weight=True，虽然上面已经关了 use_rms_norm，
+            # 但这是一个好的防御性编程习惯
+            w_trans = instance._transform_channels(w_original, is_weight=True)
             instance.conv.weight.data = w_trans
             
         return instance
-
+    
+    
 # --------------------------------------------------------
 # 验证脚本：反向传播与梯度检查
 # --------------------------------------------------------
