@@ -3,146 +3,203 @@ import torch.nn as nn
 import math
 
 # --------------------------------------------------------
-# 依赖库检查 (fwht)
+# 1. 依赖 FWHT (保持不变)
 # --------------------------------------------------------
 try:
     from fwht import fast_walsh_hadamard_transform
 except ImportError:
-    print("Warning: 'fwht' library not found. Using slow CPU fallback for debugging.")
     def fast_walsh_hadamard_transform(x):
-        # 仅供调试用的慢速实现
+        n = x.shape[-1]
+        if (n & (n - 1)) != 0:
+            raise ValueError(f"FWHT dimension must be power of 2, got {n}")
         h = 1
         output = x.clone()
-        while h < output.shape[-1]:
-            for i in range(0, output.shape[-1], h * 2):
-                for j in range(i, i + h):
-                    x_j = output[..., j]
-                    x_jh = output[..., j + h]
-                    output[..., j] = x_j + x_jh
-                    output[..., j + h] = x_j - x_jh
+        while h < n:
+            temp = output.view(*output.shape[:-1], n // (h * 2), 2, h)
+            x_j = temp[..., 0, :]
+            x_jh = temp[..., 1, :]
+            output = torch.stack([x_j + x_jh, x_j - x_jh], dim=-2).flatten(-3)
             h *= 2
-        return output / math.sqrt(output.shape[-1])
+        return output / math.sqrt(n) # 注意这里的归一化因子 sqrt(n)
 
 # --------------------------------------------------------
-# Golay 序列生成器
+# 2. Golay 序列生成 (保持不变)
 # --------------------------------------------------------
-def generate_golay_sequence(n):
-    if n == 1:
-        return torch.tensor([1.0], dtype=torch.float32)
-    half_n = n // 2
-    a_prev = generate_golay_sequence(half_n)
-    b_prev = a_prev.clone()
-    
+def generate_truncated_golay(n):
+    pow2 = 1
+    while pow2 < n: pow2 *= 2
     def _recursive_golay(k):
-        if k == 1:
-            return torch.tensor([1.]), torch.tensor([1.])
-        a_sub, b_sub = _recursive_golay(k // 2)
-        a_new = torch.cat([a_sub, b_sub])
-        b_new = torch.cat([a_sub, -b_sub])
-        return a_new, b_new
-
-    a, _ = _recursive_golay(n)
-    return a
+        if k == 1: return torch.tensor([1.0]), torch.tensor([1.0])
+        a, b = _recursive_golay(k // 2)
+        return torch.cat([a, b]), torch.cat([a, -b])
+    a_full, _ = _recursive_golay(pow2)
+    return a_full[:n]
 
 # --------------------------------------------------------
-# CompressModel 类定义
+# 3. GolayLinear (增强版)
 # --------------------------------------------------------
-class CompressModel(nn.Module):
-    def __init__(self, dim, momentum=0.1, eps=1e-5):
-        """
-        Args:
-            dim (int): 最后一维的大小 (必须是 2 的幂)。
-            momentum (float): 指数平滑因子 (alpha更新速率)。
-            eps (float): 数值稳定性微小量。
-        """
+class GolayLinear(nn.Module):
+    def __init__(
+        self, 
+        in_features, 
+        out_features, 
+        bias=True, 
+        use_rms_norm=False,
+        eps=1e-5
+    ):
         super().__init__()
-        self.dim = dim
-        self.momentum = momentum
-        self.eps = eps
+        self.in_features = in_features
+        self.out_features = out_features
+        self.use_rms_norm = use_rms_norm
 
-        # 1. Golay 序列 (Buffer: 保存但不训练)
-        self.register_buffer('golay_sequence', generate_golay_sequence(dim))
+        # 1. 计算 Block Size
+        best_block_size = 1
+        curr = 1
+        while curr <= in_features:
+            if in_features % curr == 0:
+                best_block_size = curr
+            curr *= 2
+        self.block_size = best_block_size
+        self.num_blocks = in_features // best_block_size
+        self.block_info = f"{self.num_blocks}x{self.block_size}"
 
-        # 2. Alpha (Buffer: 作为训练变量，但不受梯度影响，手动更新)
-        # 初始值设为 1.0，第一次forward时会被快速修正
-        self.register_buffer('alpha', torch.tensor(1.0))
+        # 2. Golay Buffer
+        self.register_buffer('golay_sequence', generate_truncated_golay(in_features))
+
+        # 3. Norm
+        if self.use_rms_norm:
+            self.norm = nn.RMSNorm(in_features, eps=eps)
+        else:
+            self.norm = nn.Identity()
+
+        # 4. Linear
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+
+    def _transform_features(self, x):
+        """
+        核心变换逻辑：提取出来供 forward 和 权重转换 复用
+        """
+        # A. Golay Modulation
+        # x: [..., D], golay: [D] -> Broadcast
+        x_mod = x * self.golay_sequence
+
+        # B. Block FWHT
+        original_shape = x_mod.shape
+        # View as (..., num_blocks, block_size)
+        # 注意：这里 view 的维度要小心，确保只操作最后一维
+        x_reshaped = x_mod.view(*original_shape[:-1], self.num_blocks, self.block_size)
         
-        # 辅助变量：用于判断是否初始化
-        self.register_buffer('init_done', torch.tensor(False, dtype=torch.bool))
+        # Apply FWHT on last dim
+        x_trans = fast_walsh_hadamard_transform(x_reshaped)
+        
+        # Flatten back
+        return x_trans.reshape(original_shape)
 
     def forward(self, x):
-        if x.shape[-1] != self.dim:
-            raise ValueError(f"Expected last dimension {self.dim}, got {x.shape[-1]}")
+        # 1. 变换特征
+        x_trans = self._transform_features(x)
 
-        # --- 1. Golay 调制与 FWHT 变换 ---
-        x_flat = x.reshape(-1, self.dim)
+        # 2. 归一化 (注意：开启此项将无法通过“等价转换”测试)
+        x_norm = self.norm(x_trans)
+
+        # 3. 线性投影
+        return self.linear(x_norm)
+
+    @classmethod
+    def from_pretrained(cls, original_linear: nn.Linear):
+        """
+        工厂方法：将一个训练好的 nn.Linear 转换为 GolayLinear。
+        同时变换权重，使得输出结果与原 Linear 保持近似一致。
+        """
+        in_f = original_linear.in_features
+        out_f = original_linear.out_features
+        has_bias = original_linear.bias is not None
         
-        # 点乘 Golay 序列 (Element-wise)
-        x_mod = x_flat * self.golay_sequence
+        # 1. 初始化新实例 (强制关闭 RMSNorm 以保证数学等价性)
+        # 如果你想保留 Norm 能力但不在乎初始等价性，可以手动开启
+        instance = cls(in_f, out_f, bias=has_bias, use_rms_norm=False)
         
-        # FWHT 变换
-        x_trans = fast_walsh_hadamard_transform(x_mod)
-
-        # --- 2. Alpha 更新 (仅在训练模式) ---
-        if self.training:
-            with torch.no_grad(): # 确保此过程切断梯度，不参与反向传播
-                # 计算当前 batch 的 RMS (均方根能量)
-                # target energy is 1.0, so we measure the scaling factor needed.
-                current_rms = torch.sqrt(x_trans.pow(2).mean() + self.eps)
-                
-                if not self.init_done:
-                    # 初始化：直接使用第一个 batch 的统计值
-                    self.alpha.copy_(current_rms)
-                    self.init_done.fill_(True)
-                else:
-                    # 指数平滑更新: new_alpha = (1-m)*old + m*current
-                    # 这是一个 In-place 操作
-                    self.alpha.mul_(1 - self.momentum).add_(current_rms * self.momentum)
-
-        # --- 3. 应用 Alpha (训练和推理都使用存储的 alpha) ---
-        # 注意：这里 x_trans 有梯度，self.alpha 被视为常数
-        # 结果分布将被控制在 1 附近
-        x_out = x_trans / (self.alpha + self.eps)
-
-        return x_out.reshape(x.shape)
-
-    def extra_repr(self):
-        return f'dim={self.dim}, momentum={self.momentum}, alpha={self.alpha.item():.4f}'
+        # 2. 复制 Bias (Bias 不受输入变换影响，直接复制)
+        if has_bias:
+            instance.linear.bias.data = original_linear.bias.data.clone()
+        
+        # 3. 变换 Weight
+        # 原始 Weight 形状: [out_features, in_features]
+        # 我们将其视为一批输入数据: Batch_Size = out_features, Dim = in_features
+        # 这样我们可以复用 _transform_features 逻辑
+        with torch.no_grad():
+            w_original = original_linear.weight.data
+            
+            # 这里的魔法在于：
+            # 我们对 W 的每一行（对应每个输出神经元的权重向量）做同样的 Golay+FWHT 变换。
+            # 因为 FWHT 是正交的，Golay 是 +/-1，
+            # <Tx, Tw> = <x, w> 成立。
+            w_transformed = instance._transform_features(w_original)
+            
+            # 赋值给新模型
+            instance.linear.weight.data = w_transformed
+            
+        return instance
 
 # --------------------------------------------------------
-# 验证代码
+# 验证脚本：数学等价性测试
 # --------------------------------------------------------
 if __name__ == "__main__":
-    # 设置随机种子以便观察
-    torch.manual_seed(42)
+    #torch.manual_seed(42)
     
-    dim = 256
-    model = CompressModel(dim=dim, momentum=0.1)
+    # 1. 创建一个标准的训练好的 Linear 层
+    # 使用 768 这种常见维度 (3 * 256)
+    IN_DIM = 2048
+    OUT_DIM = 2048
     
-    # 模拟高能量输入 (标准差为 10)
-    input_data = torch.randn(32, dim) * 10.0
+    std_linear = nn.Linear(IN_DIM, OUT_DIM)
     
-    print(f"初始 Alpha: {model.alpha.item()}")
-    print(f"输入数据 STD: {input_data.std():.4f}")
+    # 模拟一些“训练好”的权重 (非随机分布，增加测试难度)
+    nn.init.orthogonal_(std_linear.weight)
     
-    # --- 训练阶段 ---
-    model.train()
-    # 运行几次以观察 Alpha 的收敛
-    for i in range(5):
-        out = model(input_data)
-        print(f"Iter {i+1}: Alpha 更新为 {model.alpha.item():.4f}, 输出 STD: {out.std():.4f}")
-        
-        # 模拟反向传播 (确保没有报错)
-        loss = out.sum()
-        loss.backward()
+    print(f"原始 Linear: {std_linear}")
+
+    # 2. 使用转换方法创建 GolayLinear
+    golay_model = GolayLinear.from_pretrained(std_linear)
     
-    print("-" * 30)
+    print(f"转换后的 GolayLinear: {golay_model}")
+    print(f"FWHT 分块策略: {golay_model.block_info}")
     
-    # --- 推理阶段 ---
-    model.eval()
-    # 推理时，Alpha 应当固定不变
-    test_data = torch.randn(10, dim) * 10.0 # 同样分布的数据
-    out_test = model(test_data)
+    # 3. 生成测试输入
+    batch_size = 16
+    x = torch.randn(batch_size, IN_DIM)
     
-    print(f"推理模式 Alpha: {model.alpha.item():.4f} (应保持不变)")
-    print(f"推理输出 STD: {out_test.std():.4f} (应接近 1.0)")
+    # 4. 前向传播对比
+    with torch.no_grad():
+        y_std = std_linear(x)
+        y_golay = golay_model(x)
+    
+    # 5. 误差分析
+    # 计算最大绝对误差
+    diff = (y_std - y_golay).abs().max()
+    mse = (y_std - y_golay).pow(2).mean()
+    
+    print("-" * 40)
+    print(f"最大绝对误差 (Max Diff): {diff.item():.8f}")
+    print(f"均方误差 (MSE):       {mse.item():.8f}")
+    
+    # 验证点积守恒逻辑
+    # 如果 Diff 非常小 (例如 < 1e-5)，说明变换成功
+    if diff < 1e-4:
+        print("\n✅ 成功验证！GolayLinear 与 原 Linear 输出一致。")
+        print("这证明了 <FWHT(x*G), FWHT(w*G)> == <x, w>。")
+    else:
+        print("\n❌ 验证失败，误差过大。")
+
+    # 6. (附加测试) 验证 RMSNorm 会破坏这种等价性
+    # print("-" * 40)
+    # print("附加测试: 开启 RMSNorm 后的行为")
+    # golay_norm = GolayLinear(IN_DIM, OUT_DIM, use_rms_norm=True)
+    # # 强行把变换后的权重塞进去
+    # golay_norm.linear.weight.data = golay_model.linear.weight.data.clone()
+    # golay_norm.linear.bias.data = golay_model.linear.bias.data.clone()
+    
+    # y_norm = golay_norm(x)
+    # diff_norm = (y_std - y_norm).abs().max()
+    # print(f"开启 RMSNorm 后的误差: {diff_norm.item():.4f}")
+    # print("(这是预期内的，因为 RMSNorm 是非线性操作，破坏了线性变换的等价性)")
