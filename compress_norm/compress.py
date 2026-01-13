@@ -116,24 +116,24 @@ class GolayLinear(nn.Module):
         has_bias = original_linear.bias is not None
         
         # 1. 初始化新实例 (强制关闭 RMSNorm 以保证数学等价性)
-        # 如果你想保留 Norm 能力但不在乎初始等价性，可以手动开启
         instance = cls(in_f, out_f, bias=has_bias, use_rms_norm=False)
         
-        # 2. 复制 Bias (Bias 不受输入变换影响，直接复制)
+        # === 关键修复：同步设备 ===
+        # 获取原 Linear 的设备
+        device = original_linear.weight.device
+        # 将新实例移动到该设备 (确保 golay_sequence 也在该设备上)
+        instance.to(device)
+        # ========================
+        
+        # 2. 复制 Bias
         if has_bias:
             instance.linear.bias.data = original_linear.bias.data.clone()
         
         # 3. 变换 Weight
-        # 原始 Weight 形状: [out_features, in_features]
-        # 我们将其视为一批输入数据: Batch_Size = out_features, Dim = in_features
-        # 这样我们可以复用 _transform_features 逻辑
         with torch.no_grad():
             w_original = original_linear.weight.data
             
-            # 这里的魔法在于：
-            # 我们对 W 的每一行（对应每个输出神经元的权重向量）做同样的 Golay+FWHT 变换。
-            # 因为 FWHT 是正交的，Golay 是 +/-1，
-            # <Tx, Tw> = <x, w> 成立。
+            # 此时 w_original 和 instance 内部的 buffer 都在同一个 device 上
             w_transformed = instance._transform_features(w_original)
             
             # 赋值给新模型
