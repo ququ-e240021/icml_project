@@ -142,19 +142,25 @@ class GolayConv2d(nn.Module):
             use_rms_norm=False # 等价转换必须关闭 Norm
         )
         
+        # === 关键修复：同步设备 ===
+        # 获取原模型的设备
+        device = original_conv.weight.device
+        # 将新实例移动到同一设备 (这样 golay_sequence 也会去该设备)
+        instance.to(device)
+        # ========================
+        
         if original_conv.bias is not None:
             instance.conv.bias.data = original_conv.bias.data.clone()
             
         with torch.no_grad():
             w_original = original_conv.weight.data
-            # 在这里我们标记 is_weight=True，虽然上面已经关了 use_rms_norm，
-            # 但这是一个好的防御性编程习惯
+            # 现在 w_original 和 instance.golay_sequence 都在同一个 device 上了
             w_trans = instance._transform_channels(w_original, is_weight=True)
             instance.conv.weight.data = w_trans
             
         return instance
     
-    
+
 # --------------------------------------------------------
 # 验证脚本：反向传播与梯度检查
 # --------------------------------------------------------
